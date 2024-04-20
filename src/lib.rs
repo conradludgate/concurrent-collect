@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BinaryHeap, VecDeque},
     future::{poll_fn, Future},
     mem::MaybeUninit,
     pin::Pin,
@@ -22,12 +22,52 @@ where
     stream.drive(VecConsumer::with_capacity(lower)).await
 }
 
+pub async fn fold<Acc, Fold, Stream>(iter: Stream, init: Acc, fold: Fold) -> Acc
+where
+    Stream: IntoConcurrentStream,
+    Fold: FnMut(Acc, Stream::Item) -> Acc,
+{
+    let stream = iter.into_co_stream();
+    let (mut lower, _) = stream.size_hint();
+    if lower < 32 {
+        lower = 32;
+    }
+    stream
+        .drive(FoldConsumer {
+            len: 0,
+            rem: 0,
+            next: 0,
+            group: VecDeque::from_iter([FuturesUnorderedBounded::new(lower)]),
+            acc: Some(init),
+            fold,
+            hold: BinaryHeap::new(),
+        })
+        .await
+}
+
 #[pin_project]
 struct IndexFut<F> {
     #[pin]
     inner: F,
     index: usize,
 }
+
+impl<F> PartialOrd for IndexFut<F> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<F> Ord for IndexFut<F> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.index.cmp(&other.index).reverse()
+    }
+}
+impl<F> PartialEq for IndexFut<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+    }
+}
+impl<F> Eq for IndexFut<F> {}
 
 impl<F: Future> Future for IndexFut<F> {
     type Output = (F::Output, usize);
@@ -40,6 +80,17 @@ impl<F: Future> Future for IndexFut<F> {
         self.project().inner.poll(cx).map(|x| (x, index))
     }
 }
+
+pub(crate) struct FoldConsumer<Acc, Fut: Future, Fold> {
+    len: usize,
+    rem: usize,
+    next: usize,
+    group: VecDeque<FuturesUnorderedBounded<IndexFut<Fut>>>,
+    acc: Option<Acc>,
+    fold: Fold,
+    hold: BinaryHeap<IndexFut<Fut::Output>>,
+}
+impl<Acc, F: Future, Fold> Unpin for FoldConsumer<Acc, F, Fold> {}
 
 // TODO: replace this with a generalized `fold` operation
 pub(crate) struct VecConsumer<Fut: Future> {
@@ -153,6 +204,101 @@ where
     }
 }
 
+impl<Acc, Fut, Fold> Consumer<Fut::Output, Fut> for FoldConsumer<Acc, Fut, Fold>
+where
+    Fut: Future,
+    Fold: FnMut(Acc, Fut::Output) -> Acc,
+{
+    type Output = Acc;
+
+    async fn send(mut self: Pin<&mut Self>, future: Fut) -> ConsumerState {
+        let this = &mut *self;
+        let len = this.len;
+        this.rem += 1;
+        this.len += 1;
+
+        let last = this.group.back_mut().unwrap();
+        let fut = IndexFut {
+            inner: future,
+            index: len,
+        };
+        match last.try_push(fut) {
+            Ok(()) => {}
+            Err(future) => {
+                let mut next = FuturesUnorderedBounded::new(last.capacity() * 2);
+                next.push(future);
+                this.group.push_back(next);
+            }
+        }
+        ConsumerState::Continue
+    }
+
+    async fn progress(mut self: Pin<&mut Self>) -> ConsumerState {
+        let this = &mut *self;
+        poll_fn(|cx| {
+            loop {
+                let mut done = true;
+                let mut i = 0;
+                while i < this.group.len() {
+                    let poll = Pin::new(&mut this.group[i]).poll_next(cx);
+                    match poll {
+                        Poll::Ready(Some((mut x, index))) => {
+                            this.rem -= 1;
+                            done = false;
+                            i += 1;
+
+                            if index == this.next {
+                                loop {
+                                    this.acc = Some((this.fold)(this.acc.take().unwrap(), x));
+                                    this.next += 1;
+                                    let Some(head) = this.hold.peek() else { break };
+                                    if head.index != this.next {
+                                        break;
+                                    }
+                                    x = this.hold.pop().unwrap().inner;
+                                }
+                            } else {
+                                this.hold.push(IndexFut { inner: x, index });
+                            }
+                        }
+                        Poll::Ready(None) => {
+                            debug_assert!(this.group[i].is_empty());
+                            if i + 1 < this.group.len() {
+                                this.group.remove(i);
+                            } else if this.group.len() == 1 {
+                                debug_assert_eq!(this.rem, 0);
+                                return Poll::Ready(());
+                            } else {
+                                break;
+                            }
+                        }
+                        Poll::Pending => {
+                            i += 1;
+                        }
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        ConsumerState::Empty
+    }
+    async fn flush(mut self: Pin<&mut Self>) -> Self::Output {
+        self.as_mut().progress().await;
+        let this = &mut *self;
+        loop {
+            let Some(head) = this.hold.pop() else { break };
+            this.acc = Some((this.fold)(this.acc.take().unwrap(), head.inner));
+            this.next += 1;
+        }
+
+        std::mem::take(&mut this.acc).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -163,7 +309,7 @@ mod tests {
     use futures_concurrency::concurrent_stream::{ConcurrentStream, Consumer};
     use tokio::runtime::Builder;
 
-    use crate::collect_vec;
+    use crate::{collect_vec, fold};
 
     #[cfg(miri)]
     async fn work(x: u64) -> u64 {
@@ -210,6 +356,22 @@ mod tests {
         const N: u64 = 1024;
 
         let vec = rt.block_on(collect_vec(Iter(0..N).map(work)));
+        assert_eq!(vec, (0..N).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fold_test() {
+        let rt = Builder::new_current_thread().enable_time().build().unwrap();
+
+        #[cfg(miri)]
+        const N: u64 = 256;
+        #[cfg(not(miri))]
+        const N: u64 = 1024;
+
+        let vec = rt.block_on(fold(Iter(0..N).map(work), Vec::<u64>::new(), |mut v, i| {
+            v.push(i);
+            v
+        }));
         assert_eq!(vec, (0..N).collect::<Vec<_>>());
     }
 }
