@@ -18,8 +18,32 @@ where
     S: IntoConcurrentStream,
 {
     let stream = iter.into_co_stream();
-    let (lower, _) = stream.size_hint();
-    stream.drive(VecConsumer::with_capacity(lower)).await
+    let (mut lower, _) = stream.size_hint();
+    if lower < 32 {
+        lower = 32;
+    }
+
+    let output = stream
+        .drive(FoldConsumer {
+            len: 0,
+            rem: 0,
+            group: VecDeque::from_iter([FuturesUnorderedBounded::new(lower)]),
+            acc: Some(Vec::with_capacity(lower)),
+            fold: |mut acc: Vec<MaybeUninit<S::Item>>, IndexFut { index, inner }| {
+                if index >= acc.len() {
+                    acc.reserve(index - acc.len() + 1);
+                    acc.resize_with(index + 1, MaybeUninit::uninit);
+                }
+                acc[index].write(inner);
+                acc
+            },
+        })
+        .await;
+
+    unsafe {
+        let mut output = std::mem::ManuallyDrop::new(output);
+        Vec::from_raw_parts(output.as_mut_ptr().cast(), output.len(), output.capacity())
+    }
 }
 
 pub async fn fold<Acc, Fold, Stream>(iter: Stream, init: Acc, mut fold: Fold) -> Acc
@@ -117,118 +141,6 @@ pub(crate) struct FoldConsumer<Acc, Fut: Future, Fold> {
     fold: Fold,
 }
 impl<Acc, F: Future, Fold> Unpin for FoldConsumer<Acc, F, Fold> {}
-
-// TODO: replace this with a generalized `fold` operation
-pub(crate) struct VecConsumer<Fut: Future> {
-    len: usize,
-    rem: usize,
-    group: VecDeque<FuturesUnorderedBounded<IndexFut<Fut>>>,
-    output: Vec<MaybeUninit<Fut::Output>>,
-}
-
-impl<F: Future> Unpin for VecConsumer<F> {}
-
-impl<Fut: Future> VecConsumer<Fut> {
-    pub(crate) fn with_capacity(mut n: usize) -> Self {
-        if n < 32 {
-            n = 32;
-        }
-        Self {
-            len: 0,
-            rem: 0,
-            group: VecDeque::from_iter([FuturesUnorderedBounded::new(n)]),
-            output: Vec::with_capacity(n),
-        }
-    }
-}
-
-impl<Item, Fut> Consumer<Item, Fut> for VecConsumer<Fut>
-where
-    Fut: Future<Output = Item>,
-{
-    type Output = Vec<Item>;
-
-    async fn send(mut self: Pin<&mut Self>, future: Fut) -> ConsumerState {
-        let this = &mut *self;
-        let len = this.len;
-        this.rem += 1;
-        this.len += 1;
-
-        let last = this.group.back_mut().unwrap();
-        let fut = IndexFut {
-            inner: future,
-            index: len,
-        };
-        match last.try_push(fut) {
-            Ok(()) => {}
-            Err(future) => {
-                let mut next = FuturesUnorderedBounded::new(last.capacity() * 2);
-                next.push(future);
-                this.group.push_back(next);
-            }
-        }
-        ConsumerState::Continue
-    }
-
-    async fn progress(mut self: Pin<&mut Self>) -> ConsumerState {
-        let this = &mut *self;
-        poll_fn(|cx| {
-            loop {
-                let mut done = true;
-                let mut i = 0;
-                while i < this.group.len() {
-                    let poll = Pin::new(&mut this.group[i]).poll_next(cx);
-                    match poll {
-                        Poll::Ready(Some(IndexFut { inner, index })) => {
-                            this.rem -= 1;
-                            done = false;
-                            i += 1;
-
-                            if index >= this.output.len() {
-                                this.output.reserve(this.len - this.output.len());
-                                this.output.resize_with(this.len, || MaybeUninit::uninit());
-                            }
-                            this.output[index].write(inner);
-                        }
-                        Poll::Ready(None) => {
-                            debug_assert!(this.group[i].is_empty());
-                            if i + 1 < this.group.len() {
-                                this.group.remove(i);
-                            } else if this.group.len() == 1 {
-                                debug_assert_eq!(this.rem, 0);
-                                return Poll::Ready(());
-                            } else {
-                                break;
-                            }
-                        }
-                        Poll::Pending => {
-                            i += 1;
-                        }
-                    }
-                }
-                if done {
-                    break;
-                }
-            }
-            Poll::Pending
-        })
-        .await;
-        ConsumerState::Empty
-    }
-    async fn flush(mut self: Pin<&mut Self>) -> Self::Output {
-        self.as_mut().progress().await;
-        debug_assert_eq!(self.output.len(), self.len);
-
-        // we have initiatlised all fields
-        let mut output = std::mem::take(&mut self.output);
-        output.truncate(self.len);
-        unsafe {
-            let mut output = std::mem::ManuallyDrop::new(output);
-
-            Vec::from_raw_parts(output.as_mut_ptr().cast(), self.len, output.capacity())
-        }
-    }
-}
 
 impl<Acc, Fut, Fold> Consumer<Fut::Output, Fut> for FoldConsumer<Acc, Fut, Fold>
 where
