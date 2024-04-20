@@ -22,7 +22,7 @@ where
     stream.drive(VecConsumer::with_capacity(lower)).await
 }
 
-pub async fn fold<Acc, Fold, Stream>(iter: Stream, init: Acc, fold: Fold) -> Acc
+pub async fn fold<Acc, Fold, Stream>(iter: Stream, init: Acc, mut fold: Fold) -> Acc
 where
     Stream: IntoConcurrentStream,
     Fold: FnMut(Acc, Stream::Item) -> Acc,
@@ -32,17 +32,42 @@ where
     if lower < 32 {
         lower = 32;
     }
-    stream
+
+    let mut next = 0;
+    let mut hold = BinaryHeap::<IndexFut<Stream::Item>>::new();
+
+    let fold_mut = &mut fold;
+    let mut acc = stream
         .drive(FoldConsumer {
             len: 0,
             rem: 0,
-            next: 0,
             group: VecDeque::from_iter([FuturesUnorderedBounded::new(lower)]),
             acc: Some(init),
-            fold,
-            hold: BinaryHeap::new(),
+            fold: |mut acc, indexed: IndexFut<Stream::Item>| {
+                if indexed.index == next {
+                    let mut x = indexed.inner;
+                    loop {
+                        acc = fold_mut(acc, x);
+                        next += 1;
+                        let Some(head) = hold.peek() else { break };
+                        if head.index != next {
+                            break;
+                        }
+                        x = hold.pop().unwrap().inner;
+                    }
+                } else {
+                    hold.push(indexed);
+                }
+                acc
+            },
         })
-        .await
+        .await;
+
+    loop {
+        let Some(head) = hold.pop() else { break };
+        acc = fold(acc, head.inner);
+    }
+    acc
 }
 
 #[pin_project]
@@ -70,25 +95,26 @@ impl<F> PartialEq for IndexFut<F> {
 impl<F> Eq for IndexFut<F> {}
 
 impl<F: Future> Future for IndexFut<F> {
-    type Output = (F::Output, usize);
+    type Output = IndexFut<F::Output>;
 
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let index = self.index;
-        self.project().inner.poll(cx).map(|x| (x, index))
+        self.project()
+            .inner
+            .poll(cx)
+            .map(|inner| IndexFut { inner, index })
     }
 }
 
 pub(crate) struct FoldConsumer<Acc, Fut: Future, Fold> {
     len: usize,
     rem: usize,
-    next: usize,
     group: VecDeque<FuturesUnorderedBounded<IndexFut<Fut>>>,
     acc: Option<Acc>,
     fold: Fold,
-    hold: BinaryHeap<IndexFut<Fut::Output>>,
 }
 impl<Acc, F: Future, Fold> Unpin for FoldConsumer<Acc, F, Fold> {}
 
@@ -153,7 +179,7 @@ where
                 while i < this.group.len() {
                     let poll = Pin::new(&mut this.group[i]).poll_next(cx);
                     match poll {
-                        Poll::Ready(Some((x, index))) => {
+                        Poll::Ready(Some(IndexFut { inner, index })) => {
                             this.rem -= 1;
                             done = false;
                             i += 1;
@@ -162,7 +188,7 @@ where
                                 this.output.reserve(this.len - this.output.len());
                                 this.output.resize_with(this.len, || MaybeUninit::uninit());
                             }
-                            this.output[index].write(x);
+                            this.output[index].write(inner);
                         }
                         Poll::Ready(None) => {
                             debug_assert!(this.group[i].is_empty());
@@ -207,7 +233,7 @@ where
 impl<Acc, Fut, Fold> Consumer<Fut::Output, Fut> for FoldConsumer<Acc, Fut, Fold>
 where
     Fut: Future,
-    Fold: FnMut(Acc, Fut::Output) -> Acc,
+    Fold: FnMut(Acc, IndexFut<Fut::Output>) -> Acc,
 {
     type Output = Acc;
 
@@ -242,24 +268,12 @@ where
                 while i < this.group.len() {
                     let poll = Pin::new(&mut this.group[i]).poll_next(cx);
                     match poll {
-                        Poll::Ready(Some((mut x, index))) => {
+                        Poll::Ready(Some(x)) => {
                             this.rem -= 1;
                             done = false;
                             i += 1;
 
-                            if index == this.next {
-                                loop {
-                                    this.acc = Some((this.fold)(this.acc.take().unwrap(), x));
-                                    this.next += 1;
-                                    let Some(head) = this.hold.peek() else { break };
-                                    if head.index != this.next {
-                                        break;
-                                    }
-                                    x = this.hold.pop().unwrap().inner;
-                                }
-                            } else {
-                                this.hold.push(IndexFut { inner: x, index });
-                            }
+                            this.acc = Some((this.fold)(this.acc.take().unwrap(), x));
                         }
                         Poll::Ready(None) => {
                             debug_assert!(this.group[i].is_empty());
@@ -288,14 +302,7 @@ where
     }
     async fn flush(mut self: Pin<&mut Self>) -> Self::Output {
         self.as_mut().progress().await;
-        let this = &mut *self;
-        loop {
-            let Some(head) = this.hold.pop() else { break };
-            this.acc = Some((this.fold)(this.acc.take().unwrap(), head.inner));
-            this.next += 1;
-        }
-
-        std::mem::take(&mut this.acc).unwrap()
+        std::mem::take(&mut self.acc).unwrap()
     }
 }
 
