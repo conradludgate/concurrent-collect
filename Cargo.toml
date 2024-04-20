@@ -1,0 +1,21 @@
+[package]
+name = "concurrent-collect"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures-concurrency = "7.6.0"
+futures-buffered = "0.2.4"
+pin-project = "1"
+futures-core = "0.3"
+
+[dev-dependencies]
+divan = "0.1"
+tokio = { version = "1", features = ["rt", "time"]}
+futures-executor = "0.3.30"
+
+[[bench]]
+name = "collect"
+harness = false
